@@ -107,7 +107,10 @@ class RandomSamplingNegPos(BaseTransform):
                 'transformers is not installed, please install it by: '
                 'pip install transformers.')
 
-        self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
+        # self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
+        self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, use_fast=True)
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
         self.num_sample_negative = num_sample_negative
         self.full_sampling_prob = full_sampling_prob
         self.max_tokens = max_tokens
