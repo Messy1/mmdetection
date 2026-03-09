@@ -56,12 +56,14 @@ class GroundingDINO(DINO):
                  language_model,
                  *args,
                  use_autocast=False,
+                 text_mapper_hidden_dim=1024,
                  **kwargs) -> None:
 
         self.language_model_cfg = language_model
         # Modified: Use comma and space for LLM natural language understanding
         self._special_tokens = '. '
         self.use_autocast = use_autocast
+        self.text_mapper_hidden_dim = text_mapper_hidden_dim
         super().__init__(*args, **kwargs)
 
     def _init_layers(self) -> None:
@@ -91,10 +93,17 @@ class GroundingDINO(DINO):
         else:
             lang_dim = self.language_model.language_backbone.body.language_dim
 
-        self.text_feat_map = nn.Linear(
-            lang_dim,
-            self.embed_dims,
-            bias=True)
+        # self.text_feat_map = nn.Linear(
+        #     lang_dim,
+        #     self.embed_dims,
+        #     bias=True)
+        text_mapper_hidden_dim = self.text_mapper_hidden_dim
+        self.text_feat_map = nn.Sequential(
+            nn.Linear(lang_dim, text_mapper_hidden_dim),
+            nn.LayerNorm(text_mapper_hidden_dim),
+            nn.GELU(),
+            nn.Linear(text_mapper_hidden_dim, self.embed_dims, bias=True)
+        )
 
     def init_weights(self) -> None:
         """Initialize weights for Transformer and other components."""
