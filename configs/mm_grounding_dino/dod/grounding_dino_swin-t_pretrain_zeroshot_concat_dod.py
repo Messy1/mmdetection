@@ -1,4 +1,6 @@
-_base_ = '../grounding_dino_llm2vec_swin-t_pretrain.py'
+# _base_ = '../grounding_dino_llm2vec_swin-t_pretrain.py'
+_base_ = '../grounding_dino_llm2clip_swin-t_pretrain.py'
+
 
 data_root = 'data/d3/'
 

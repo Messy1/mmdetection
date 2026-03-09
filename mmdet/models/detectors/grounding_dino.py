@@ -60,7 +60,7 @@ class GroundingDINO(DINO):
 
         self.language_model_cfg = language_model
         # Modified: Use comma and space for LLM natural language understanding
-        self._special_tokens = ', '
+        self._special_tokens = '. '
         self.use_autocast = use_autocast
         super().__init__(*args, **kwargs)
 
@@ -144,7 +144,7 @@ class GroundingDINO(DINO):
         original_caption: Union[str, list, tuple],
         custom_entities: bool = False,
         enhanced_text_prompts: Optional[ConfigType] = None
-    ) -> Tuple[dict, str, list]:
+    ) -> Tuple[dict, str, list, list]:
         """Get the tokens positive and prompts for the caption."""
         if isinstance(original_caption, (list, tuple)) or custom_entities:
             if custom_entities and isinstance(original_caption, str):
@@ -166,59 +166,67 @@ class GroundingDINO(DINO):
             # that in GLIP. The tokenizer in GLIP will pad the
             # caption_string to max_length, while the tokenizer
             # in Grounding DINO will not.
-            # Modified: Added return_offsets_mapping=True
             tokenized = self.language_model.tokenizer(
                 [caption_string],
                 padding='max_length'
                 if self.language_model.pad_to_max else 'longest',
                 return_tensors='pt',
-                return_offsets_mapping=True)
+                return_offsets_mapping=True) # Retained for compatibility, but unused below
             entities = original_caption
         else:
             if not original_caption.endswith('.'):
                 original_caption = original_caption + self._special_tokens
-            # NOTE: Tokenizer in Grounding DINO is different from
-            # that in GLIP. The tokenizer in GLIP will pad the
-            # caption_string to max_length, while the tokenizer
-            # in Grounding DINO will not.
-            # Modified: Added return_offsets_mapping=True
             tokenized = self.language_model.tokenizer(
                 [original_caption],
                 padding='max_length'
                 if self.language_model.pad_to_max else 'longest',
                 return_tensors='pt',
-                return_offsets_mapping=True)
+                return_offsets_mapping=True) # Retained for compatibility, but unused below
             tokens_positive, noun_phrases = run_ner(original_caption)
             entities = noun_phrases
             caption_string = original_caption
 
         return tokenized, caption_string, tokens_positive, entities
 
-    def get_positive_map(self, tokenized, tokens_positive):
-        # Modified: Completely rewrite for BPE and Interval Overlap
+    # =========================================================================
+    # 【核心修改 1】：彻底重写 get_positive_map，加入 caption_string 参数
+    # =========================================================================
+    def get_positive_map(self, tokenized, tokens_positive, caption_string=None):
+        """Modified: Completely rewrite for Tiktoken (LLaMA-3) and sub-string matching.
+        """
         max_text_len = self.bbox_head.cls_branches[self.decoder.num_layers].max_text_len
         positive_map = torch.zeros((len(tokens_positive), max_text_len), dtype=torch.float)
         
-        # offset_mapping shape is typically [batch_size, seq_len, 2]
-        offset_mapping = tokenized['offset_mapping'][0] 
+        # 获取全文的 input_ids
+        input_ids = tokenized['input_ids'][0].tolist()
+        tokenizer = self.language_model.tokenizer
         
         for j, tok_pos in enumerate(tokens_positive): 
             for (char_start, char_end) in tok_pos:
-                for token_idx, offset in enumerate(offset_mapping):
-                    if token_idx >= max_text_len:
-                        break 
-                        
-                    token_start, token_end = offset[0].item(), offset[1].item()
+                # 必须有 original string 才能截取子串，否则跳过
+                if caption_string is None:
+                    continue
                     
-                    # Skip special tokens and paddings (where start == end)
-                    if token_start == token_end:
+                target_word = caption_string[char_start:char_end]
+                
+                # 处理 Tiktoken 前置空格特性的多种匹配模式
+                word_tokens_a = tokenizer(target_word, add_special_tokens=False).input_ids
+                word_tokens_b = tokenizer(" " + target_word, add_special_tokens=False).input_ids
+                
+                found = False
+                for search_ids in [word_tokens_b, word_tokens_a]:
+                    if found or len(search_ids) == 0:
                         continue
                         
-                    # Calculate Interval Overlap
-                    overlap = max(0, min(token_end, char_end) - max(token_start, char_start))
-                    
-                    if overlap > 0:
-                        positive_map[j, token_idx] = 1.0
+                    n = len(search_ids)
+                    for k in range(len(input_ids) - n + 1):
+                        if input_ids[k : k + n] == search_ids:
+                            # 找到了匹配的子串，写入 positive_map
+                            actual_len = min(k + n, max_text_len)
+                            if k < max_text_len:
+                                positive_map[j, k : actual_len] = 1.0
+                            found = True
+                            break
 
         positive_map_label_to_token = create_positive_map_label_to_token(
             positive_map, plus=1)
@@ -241,15 +249,18 @@ class GroundingDINO(DINO):
             else:
                 if not original_caption.endswith('.'):
                     original_caption = original_caption + self._special_tokens
-                # Modified: Added return_offsets_mapping=True
                 tokenized = self.language_model.tokenizer(
                     [original_caption],
                     padding='max_length'
                     if self.language_model.pad_to_max else 'longest',
                     return_tensors='pt',
                     return_offsets_mapping=True)
+                
+                # =================================================================
+                # 【核心修改 2】：向 get_positive_map 传入 original_caption 
+                # =================================================================
                 positive_map_label_to_token, positive_map = \
-                    self.get_positive_map(tokenized, tokens_positive)
+                    self.get_positive_map(tokenized, tokens_positive, original_caption)
 
                 entities = []
                 for token_positive in tokens_positive:
@@ -274,8 +285,12 @@ class GroundingDINO(DINO):
             tokenized, caption_string, tokens_positive, entities = \
                 self.get_tokens_and_prompts(
                     original_caption, custom_entities, enhanced_text_prompt)
+            
+            # =================================================================
+            # 【核心修改 3】：向 get_positive_map 传入 caption_string 
+            # =================================================================
             positive_map_label_to_token, positive_map = self.get_positive_map(
-                tokenized, tokens_positive)
+                tokenized, tokens_positive, caption_string)
         return positive_map_label_to_token, caption_string, \
             positive_map, entities
 
@@ -303,7 +318,6 @@ class GroundingDINO(DINO):
             else:
                 caption_string, tokens_positive = self.to_plain_text_prompts(
                     original_caption_chunked[i])
-            # Modified: Added return_offsets_mapping=True
             tokenized = self.language_model.tokenizer([caption_string],
                                                       return_tensors='pt',
                                                       return_offsets_mapping=True)
@@ -311,8 +325,12 @@ class GroundingDINO(DINO):
                 warnings.warn('Inputting a text that is too long will result '
                               'in poor prediction performance. '
                               'Please reduce the --chunked-size.')
+                
+            # =================================================================
+            # 【核心修改 4】：向 get_positive_map 传入 caption_string 
+            # =================================================================
             positive_map_label_to_token, positive_map = self.get_positive_map(
-                tokenized, tokens_positive)
+                tokenized, tokens_positive, caption_string)
 
             caption_string_chunked.append(caption_string)
             positive_map_label_to_token_chunked.append(
@@ -460,7 +478,6 @@ class GroundingDINO(DINO):
             positive_maps = []
             for token_positive, text_prompt, gt_label in zip(
                     tokens_positive, text_prompts, gt_labels):
-                # Modified: Added return_offsets_mapping=True
                 tokenized = self.language_model.tokenizer(
                     [text_prompt],
                     padding='max_length'
@@ -470,8 +487,11 @@ class GroundingDINO(DINO):
                 new_tokens_positive = [
                     token_positive[label.item()] for label in gt_label
                 ]
+                # =================================================================
+                # 【核心修改 5】：向 get_positive_map 传入 text_prompt
+                # =================================================================
                 _, positive_map = self.get_positive_map(
-                    tokenized, new_tokens_positive)
+                    tokenized, new_tokens_positive, text_prompt)
                 positive_maps.append(positive_map)
             new_text_prompts = text_prompts
         else:
@@ -488,8 +508,11 @@ class GroundingDINO(DINO):
                     new_tokens_positive = [
                         tokens_positive[label] for label in gt_label
                     ]
+                    # =================================================================
+                    # 【核心修改 6】：向 get_positive_map 传入 caption_string
+                    # =================================================================
                     _, positive_map = self.get_positive_map(
-                        tokenized, new_tokens_positive)
+                        tokenized, new_tokens_positive, caption_string)
                     positive_maps.append(positive_map)
             else:
                 for text_prompt, gt_label in zip(text_prompts, gt_labels):
@@ -499,8 +522,11 @@ class GroundingDINO(DINO):
                     new_tokens_positive = [
                         tokens_positive[label] for label in gt_label
                     ]
+                    # =================================================================
+                    # 【核心修改 7】：向 get_positive_map 传入 caption_string
+                    # =================================================================
                     _, positive_map = self.get_positive_map(
-                        tokenized, new_tokens_positive)
+                        tokenized, new_tokens_positive, caption_string)
                     positive_maps.append(positive_map)
                     new_text_prompts.append(caption_string)
 

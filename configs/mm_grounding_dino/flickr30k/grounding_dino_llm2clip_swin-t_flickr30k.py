@@ -48,7 +48,7 @@ datasets = [dataset_Flickr30k_val, dataset_Flickr30k_test]
 metrics = [val_evaluator_Flickr30k, test_evaluator_Flickr30k]
 
 val_dataloader = dict(
-    batch_size=1,  # LLM 显存占用较大，推理时必须保持 bs=1
+    batch_size=4,  # LLM 显存占用较大，推理时必须保持 bs=1
     num_workers=2,
     dataset=dict(_delete_=True, type='ConcatDataset', datasets=datasets))
 test_dataloader = val_dataloader

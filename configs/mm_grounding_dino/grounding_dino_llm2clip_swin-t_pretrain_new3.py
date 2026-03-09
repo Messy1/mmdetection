@@ -15,8 +15,7 @@ model = dict(
     )
 )
 
-# ==================== 2. 数据流与切词对齐 (最关键的一步) ====================
-# 必须重写 train_pipeline，以确保数据预处理使用的是 LLM2CLIP 的 Tokenizer
+# ==================== 2. 数据流与切词对齐 ====================
 train_pipeline = [
     dict(type='LoadImageFromFile', backend_args=None),
     dict(type='LoadAnnotations', with_bbox=True),
@@ -53,7 +52,7 @@ train_pipeline = [
     dict(type='FilterAnnotations', min_gt_bbox_wh=(1e-2, 1e-2)),
     dict(
         type='RandomSamplingNegPos',
-        tokenizer_name=llm2clip_path,  # 【核心修正】：统一使用 LLM2CLIP 分词器
+        tokenizer_name=llm2clip_path,  # 统一使用 LLM2CLIP 分词器
         num_sample_negative=85,
         max_tokens=256),
     dict(
@@ -63,7 +62,6 @@ train_pipeline = [
                    'custom_entities', 'tokens_positive', 'dataset_mode'))
 ]
 
-# 将修正后的 pipeline 绑定到三个数据集上
 o365v1_od_dataset = dict(
     type='ODVGDataset',
     data_root='data/objects365v1/',
@@ -97,37 +95,50 @@ gqa_dataset = dict(
     return_classes=True,
     backend_args=None)
 
-# 重新组装 DataLoader
 train_dataloader = dict(
     _delete_=True,
-    batch_size=8,  # FP32 安全起见用 4
-    num_workers=8,
+    batch_size=16,
+    num_workers=16,
     persistent_workers=True,
     sampler=dict(type='DefaultSampler', shuffle=True),
     batch_sampler=dict(type='AspectRatioBatchSampler'),
     dataset=dict(type='ConcatDataset', datasets=[o365v1_od_dataset, flickr30k_dataset, gqa_dataset])
 )
 
-# ==================== 3. 优化器、策略与 Hook ====================
+# ==================== 3. Stage 2 微调专用优化器与策略 ====================
 optim_wrapper = dict(
     _delete_=True,
     type='OptimWrapper', 
-    optimizer=dict(type='AdamW', lr=0.0004, weight_decay=0.0001),
+    # 🔥 核心改变 1：基础学习率直降 10 倍 (0.0004 -> 0.00004)
+    optimizer=dict(type='AdamW', lr=0.000004, weight_decay=0.0001),
     clip_grad=dict(max_norm=0.1, norm_type=2), 
     paramwise_cfg=dict(
         custom_keys={
             'absolute_pos_embed': dict(decay_mult=0.),
-            'backbone': dict(lr_mult=0.1),       
+            'backbone': dict(lr_mult=0.1),
+            # 🔥 核心改变 2：投影层继续保持 10 倍优势，吃透这波微调红利
+            'text_feat_map': dict(lr_mult=10.0, decay_mult=1.0),
             'language_model': dict(lr_mult=0.0)  
         }
     )
 )
 
-max_epochs = 4
+# 🔥 核心改变 3：重塑训练生命周期 (再跑 2 个 Epoch 压榨极限)
+max_epochs = 5 
+param_scheduler = [
+    # 给重置了动量的优化器一个极其短暂的 500 步缓冲期，防止由于截断带来的初期 Loss 震荡
+    dict(type='LinearLR', start_factor=0.1, by_epoch=False, begin=0, end=500),
+    dict(
+        type='MultiStepLR',
+        begin=0,
+        end=max_epochs,
+        by_epoch=True,
+        milestones=[1,2], # 在第 1 个 Epoch 跑完时，再降维打击一次 (变为 0.000004)
+        gamma=0.2)
+]
 train_cfg = dict(type='EpochBasedTrainLoop', max_epochs=max_epochs, val_interval=1)
 auto_scale_lr = dict(enable=True, base_batch_size=64)
 
-# 保留你原本优秀的 Checkpoint 存盘策略
 default_hooks = dict(
     checkpoint=dict(
         type='CheckpointHook', 
@@ -138,11 +149,12 @@ default_hooks = dict(
     ),
     visualization=dict(type='GroundingVisualizationHook'))
 
-load_from = '/ssd/wzh/models/groundingdino_swin-t_pruned_for_llm.pth'
-
 env_cfg = dict(
     dist_cfg=dict(
         backend='nccl', 
         timeout=28800 # 8 Hours
     )
 )
+
+# 🔥 核心改变 4：精准对接刚刚跑完的 10500 步断点
+load_from = '/home/wanzhiheng/workspace/mmdetection/work_dirs/grounding_dino_llm2clip_swin-t_pretrain_new2/iter_10500.pth'

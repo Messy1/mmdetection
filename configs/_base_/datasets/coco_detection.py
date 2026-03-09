@@ -69,6 +69,7 @@ val_evaluator = dict(
     ann_file=data_root + 'annotations/instances_val2017.json',
     metric='bbox',
     format_only=False,
+    collect_device='gpu',
     backend_args=backend_args)
 test_evaluator = val_evaluator
 

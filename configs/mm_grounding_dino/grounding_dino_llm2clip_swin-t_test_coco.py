@@ -24,8 +24,8 @@ test_pipeline = [
 
 # 重新定义验证/测试的 DataLoader
 val_dataloader = dict(
-    batch_size=4,  # LLM 推理时显存占用大，测试时保持 bs=1 最安全
-    num_workers=4,
+    batch_size=2,  # LLM 推理时显存占用大，测试时保持 bs=1 最安全
+    num_workers=2,
     persistent_workers=True,
     drop_last=False,
     sampler=dict(type='DefaultSampler', shuffle=False),

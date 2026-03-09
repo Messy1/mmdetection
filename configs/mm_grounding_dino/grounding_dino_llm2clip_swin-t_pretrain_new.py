@@ -100,8 +100,8 @@ gqa_dataset = dict(
 # 重新组装 DataLoader
 train_dataloader = dict(
     _delete_=True,
-    batch_size=8,  # FP32 安全起见用 4
-    num_workers=8,
+    batch_size=16,
+    num_workers=16,
     persistent_workers=True,
     sampler=dict(type='DefaultSampler', shuffle=True),
     batch_sampler=dict(type='AspectRatioBatchSampler'),
@@ -117,13 +117,24 @@ optim_wrapper = dict(
     paramwise_cfg=dict(
         custom_keys={
             'absolute_pos_embed': dict(decay_mult=0.),
-            'backbone': dict(lr_mult=0.1),       
+            'backbone': dict(lr_mult=0.1),
+            'text_feat_map': dict(lr_mult=10.0, decay_mult=1.0),
             'language_model': dict(lr_mult=0.0)  
         }
     )
 )
 
-max_epochs = 4
+max_epochs = 5
+param_scheduler = [
+    dict(type='LinearLR', start_factor=0.1, by_epoch=False, begin=0, end=1000),
+    dict(
+        type='MultiStepLR',
+        begin=0,
+        end=max_epochs,
+        by_epoch=True,
+        milestones=[0, 3],
+        gamma=0.1)
+]
 train_cfg = dict(type='EpochBasedTrainLoop', max_epochs=max_epochs, val_interval=1)
 auto_scale_lr = dict(enable=True, base_batch_size=64)
 
@@ -139,10 +150,3 @@ default_hooks = dict(
     visualization=dict(type='GroundingVisualizationHook'))
 
 load_from = '/ssd/wzh/models/groundingdino_swin-t_pruned_for_llm.pth'
-
-env_cfg = dict(
-    dist_cfg=dict(
-        backend='nccl', 
-        timeout=28800 # 8 Hours
-    )
-)
