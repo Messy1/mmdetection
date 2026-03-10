@@ -1,6 +1,6 @@
 _base_ = 'grounding_dino_swin-t_pretrain_obj365_goldg.py'
 
-llm2clip_path = '/ssd/wzh/models/LLM2CLIP-Llama-3.2-1B-Instruct-CC-Finetuned'
+llm2clip_path = '/share/wzh/models/LLM2CLIP-Llama-3.2-1B-Instruct-CC-Finetuned'
 
 # ==================== 1. 模型配置 ====================
 model = dict(
@@ -113,7 +113,7 @@ train_dataloader = dict(
 optim_wrapper = dict(
     _delete_=True,
     type='OptimWrapper', 
-    optimizer=dict(type='AdamW', lr=0.0004, weight_decay=0.0001),
+    optimizer=dict(type='AdamW', lr=0.00004, weight_decay=0.0001),
     clip_grad=dict(max_norm=0.1, norm_type=2), 
     paramwise_cfg=dict(
         custom_keys={
@@ -160,7 +160,7 @@ custom_hooks = [
     )
 ]
 
-load_from = '/ssd/wzh/models/groundingdino_swin-t_pruned_for_llm.pth'
+load_from = '/share/wzh/models/groundingdino_swin-t_pruned_for_llm.pth'
 
 env_cfg = dict(
     dist_cfg=dict(

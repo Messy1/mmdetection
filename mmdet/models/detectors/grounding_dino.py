@@ -108,8 +108,20 @@ class GroundingDINO(DINO):
     def init_weights(self) -> None:
         """Initialize weights for Transformer and other components."""
         super().init_weights()
-        nn.init.constant_(self.text_feat_map.bias.data, 0)
-        nn.init.xavier_uniform_(self.text_feat_map.weight.data)
+        # nn.init.constant_(self.text_feat_map.bias.data, 0)
+        # nn.init.xavier_uniform_(self.text_feat_map.weight.data)
+        if isinstance(self.text_feat_map, nn.Sequential):
+            # 遍历 Sequential 里的所有子模块
+            for m in self.text_feat_map.modules():
+                if isinstance(m, nn.Linear):
+                    nn.init.xavier_uniform_(m.weight.data)
+                    # 检查是否存在 bias (因为我们第一层设了 bias=False)
+                    if m.bias is not None:
+                        nn.init.constant_(m.bias.data, 0)
+        else:
+            # 兼容老版本的单层写法
+            nn.init.xavier_uniform_(self.text_feat_map.weight.data)
+            nn.init.constant_(self.text_feat_map.bias.data, 0)
 
     def to_enhance_text_prompts(self, original_caption, enhanced_text_prompts):
         caption_string = ''
