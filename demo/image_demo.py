@@ -180,6 +180,7 @@ def main():
 
     chunked_size = call_args.pop('chunked_size')
     inferencer.model.test_cfg.chunked_size = chunked_size
+    inferencer.model.test_cfg.max_per_img = 1  # 只保留top1
 
     inferencer(**call_args)
 

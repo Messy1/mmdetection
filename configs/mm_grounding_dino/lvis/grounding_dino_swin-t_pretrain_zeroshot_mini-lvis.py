@@ -1,4 +1,4 @@
-_base_ = '../grounding_dino_swin-t_pretrain_obj365.py'
+_base_ = '../grounding_dino_llm2clip_mlp.py'
 
 model = dict(test_cfg=dict(
     max_per_img=300,

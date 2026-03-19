@@ -23,8 +23,8 @@ from .glip import (create_positive_map, create_positive_map_label_to_token,
 def clean_label_name(name: str) -> str:
     name = re.sub(r'\(.*\)', '', name)
     name = re.sub(r'_', ' ', name)
-    name = re.sub(r'  ', ' ', name)
-    return name
+    name = re.sub(r'\s+', ' ', name)
+    return name.strip()
 
 
 def chunks(lst: list, n: int) -> list:
@@ -57,6 +57,7 @@ class GroundingDINO(DINO):
                  *args,
                  use_autocast=False,
                  text_mapper_hidden_dim=1024,
+                 text_mapper_type='mlp',
                  **kwargs) -> None:
 
         self.language_model_cfg = language_model
@@ -64,6 +65,7 @@ class GroundingDINO(DINO):
         self._special_tokens = '. '
         self.use_autocast = use_autocast
         self.text_mapper_hidden_dim = text_mapper_hidden_dim
+        self.text_mapper_type = text_mapper_type
         super().__init__(*args, **kwargs)
 
     def _init_layers(self) -> None:
@@ -97,13 +99,26 @@ class GroundingDINO(DINO):
         #     lang_dim,
         #     self.embed_dims,
         #     bias=True)
+        text_mapper_type = str(self.text_mapper_type).lower()
         text_mapper_hidden_dim = self.text_mapper_hidden_dim
-        self.text_feat_map = nn.Sequential(
-            nn.Linear(lang_dim, text_mapper_hidden_dim),
-            nn.LayerNorm(text_mapper_hidden_dim),
-            nn.GELU(),
-            nn.Linear(text_mapper_hidden_dim, self.embed_dims, bias=True)
-        )
+        if text_mapper_type == 'linear' or (
+                text_mapper_hidden_dim is not None
+                and text_mapper_hidden_dim <= 0):
+            self.text_feat_map = nn.Linear(
+                lang_dim,
+                self.embed_dims,
+                bias=True)
+        elif text_mapper_type == 'mlp':
+            self.text_feat_map = nn.Sequential(
+                nn.Linear(lang_dim, text_mapper_hidden_dim),
+                nn.LayerNorm(text_mapper_hidden_dim),
+                nn.GELU(),
+                nn.Linear(text_mapper_hidden_dim, self.embed_dims, bias=True)
+            )
+        else:
+            raise ValueError(
+                f'Unsupported text_mapper_type={self.text_mapper_type}. '
+                'Expected one of: "mlp", "linear".')
 
     def init_weights(self) -> None:
         """Initialize weights for Transformer and other components."""
@@ -192,7 +207,7 @@ class GroundingDINO(DINO):
                 padding='max_length'
                 if self.language_model.pad_to_max else 'longest',
                 return_tensors='pt',
-                return_offsets_mapping=True) # Retained for compatibility, but unused below
+                return_offsets_mapping=True)  # Used by get_positive_map.
             entities = original_caption
         else:
             if not original_caption.endswith('.'):
@@ -202,7 +217,7 @@ class GroundingDINO(DINO):
                 padding='max_length'
                 if self.language_model.pad_to_max else 'longest',
                 return_tensors='pt',
-                return_offsets_mapping=True) # Retained for compatibility, but unused below
+                return_offsets_mapping=True)  # Used by get_positive_map.
             tokens_positive, noun_phrases = run_ner(original_caption)
             entities = noun_phrases
             caption_string = original_caption
@@ -212,9 +227,132 @@ class GroundingDINO(DINO):
     # =========================================================================
     # 【核心修改 1】：彻底重写 get_positive_map，加入 caption_string 参数
     # =========================================================================
-    def get_positive_map(self, tokenized, tokens_positive, caption_string=None):
-        """Modified: Completely rewrite for Tiktoken (LLaMA-3) and sub-string matching.
+    @staticmethod
+    def _get_char_to_token(tokenized, char_pos: int) -> Optional[int]:
+        """Compatibility wrapper for tokenizer.char_to_token()."""
+        if char_pos < 0 or not hasattr(tokenized, 'char_to_token'):
+            return None
+
+        try:
+            pos = tokenized.char_to_token(0, char_pos)
+            if pos is not None:
+                return pos
+        except TypeError:
+            pass
+        except Exception:
+            return None
+
+        try:
+            return tokenized.char_to_token(char_pos)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _get_offset_mapping(tokenized) -> Optional[list]:
+        offsets = tokenized.get('offset_mapping', None)
+        if offsets is None:
+            return None
+        if torch.is_tensor(offsets):
+            offsets = offsets.detach().cpu().tolist()
+        if len(offsets) == 0:
+            return []
+
+        first_elem = offsets[0]
+        if isinstance(first_elem, (list, tuple)) and len(first_elem) > 0 \
+                and isinstance(first_elem[0], (list, tuple)):
+            offsets = first_elem
+
+        return [(int(start), int(end)) for start, end in offsets]
+
+    @staticmethod
+    def _to_prompt_entity_name(name: str) -> str:
+        """Convert raw class name to prompt-friendly text.
+
+        Keep disambiguation words inside parentheses (e.g. `bat_(animal)` ->
+        `bat animal`) to reduce ambiguity in LVIS.
         """
+        name = name.replace('_', ' ')
+        name = name.replace('(', ' ').replace(')', ' ')
+        name = re.sub(r'\s+', ' ', name)
+        return name.strip()
+
+    def _split_entities_by_token_budget(self, prompt_entities: list,
+                                        display_entities: list) -> list:
+        """Split entity list into chunks that fit language_model.max_tokens."""
+        max_tokens = self.language_model.max_tokens
+        chunks_ = []
+        cur_prompt = []
+        cur_display = []
+
+        for prompt_name, display_name in zip(prompt_entities, display_entities):
+            test_prompt = cur_prompt + [prompt_name]
+            caption_test, _ = self.to_plain_text_prompts(test_prompt)
+            tokenized_test = self.language_model.tokenizer([caption_test],
+                                                           return_tensors='pt')
+            token_len = tokenized_test.input_ids.shape[1]
+            if len(cur_prompt) > 0 and token_len > max_tokens:
+                chunks_.append((cur_prompt, cur_display))
+                cur_prompt = [prompt_name]
+                cur_display = [display_name]
+            else:
+                cur_prompt = test_prompt
+                cur_display = cur_display + [display_name]
+
+        if len(cur_prompt) > 0:
+            chunks_.append((cur_prompt, cur_display))
+        return chunks_
+
+    def _force_single_class_alignment(self, tokenized, tokens_positive,
+                                      caption_string):
+        """Force a non-empty map for a single class when all matching fails."""
+        max_text_len = self.bbox_head.cls_branches[
+            self.decoder.num_layers].max_text_len
+        positive_map = torch.zeros((1, max_text_len), dtype=torch.float)
+
+        offset_mapping = self._get_offset_mapping(tokenized)
+        if offset_mapping is not None and len(tokens_positive) > 0 and \
+                len(tokens_positive[0]) > 0:
+            char_start, char_end = tokens_positive[0][0]
+            char_start = max(int(char_start), 0)
+            char_end = max(int(char_end), char_start)
+            while char_start < char_end and caption_string[char_start].isspace():
+                char_start += 1
+            while char_end > char_start and caption_string[char_end - 1].isspace():
+                char_end -= 1
+            for tok_ind, (tok_start, tok_end) in enumerate(
+                    offset_mapping[:max_text_len]):
+                if tok_end <= tok_start:
+                    continue
+                if tok_start < char_end and tok_end > char_start:
+                    positive_map[0, tok_ind] = 1.0
+
+        # Fallback: use the first valid token span.
+        if positive_map[0].sum() == 0 and offset_mapping is not None:
+            for tok_ind, (tok_start, tok_end) in enumerate(
+                    offset_mapping[:max_text_len]):
+                if tok_end > tok_start:
+                    positive_map[0, tok_ind] = 1.0
+                    break
+
+        # Last fallback: use the first non-pad token.
+        if positive_map[0].sum() == 0 and 'attention_mask' in tokenized:
+            attention_mask = tokenized['attention_mask'][0]
+            if torch.is_tensor(attention_mask):
+                attention_mask = attention_mask.detach().cpu().tolist()
+            for tok_ind, mask_v in enumerate(attention_mask[:max_text_len]):
+                if mask_v:
+                    positive_map[0, tok_ind] = 1.0
+                    break
+
+        positive_map_label_to_token = create_positive_map_label_to_token(
+            positive_map, plus=1)
+        return positive_map_label_to_token, positive_map
+
+    def _legacy_get_positive_map(self,
+                                 tokenized,
+                                 tokens_positive,
+                                 caption_string=None):
+        """Create token-level positive map from character-level spans."""
         max_text_len = self.bbox_head.cls_branches[self.decoder.num_layers].max_text_len
         positive_map = torch.zeros((len(tokens_positive), max_text_len), dtype=torch.float)
         
@@ -252,6 +390,132 @@ class GroundingDINO(DINO):
         positive_map_label_to_token = create_positive_map_label_to_token(
             positive_map, plus=1)
             
+        return positive_map_label_to_token, positive_map
+
+    def get_positive_map(self, tokenized, tokens_positive, caption_string=None):
+        """Create token-level positive map from character-level spans."""
+        # Keep backward-compatible behavior for non-chunked settings
+        # (e.g., COCO eval in this project), and use robust alignment for
+        # chunked inference (e.g., LVIS with many categories).
+        chunked_size = self.test_cfg.get('chunked_size', -1)
+        if self.training or chunked_size <= 0:
+            return self._legacy_get_positive_map(tokenized, tokens_positive,
+                                                 caption_string)
+
+        max_text_len = self.bbox_head.cls_branches[
+            self.decoder.num_layers].max_text_len
+        positive_map = torch.zeros(
+            (len(tokens_positive), max_text_len), dtype=torch.float)
+
+        offset_mapping = self._get_offset_mapping(tokenized)
+        tokenizer = self.language_model.tokenizer
+        input_ids = tokenized['input_ids'][0]
+        if torch.is_tensor(input_ids):
+            input_ids = input_ids.detach().cpu().tolist()
+
+        for j, tok_pos in enumerate(tokens_positive):
+            for (char_start, char_end) in tok_pos:
+                if caption_string is None:
+                    continue
+
+                char_start = max(int(char_start), 0)
+                char_end = max(int(char_end), char_start)
+                # Trim whitespace boundaries to avoid mapping spans that
+                # end/start on separator spaces.
+                while char_start < char_end and caption_string[char_start].isspace():
+                    char_start += 1
+                while char_end > char_start and caption_string[char_end - 1].isspace():
+                    char_end -= 1
+                if char_end <= char_start:
+                    continue
+
+                matched_token_inds = []
+
+                # Preferred path: offset overlap on [char_start, char_end).
+                if offset_mapping is not None:
+                    valid_len = min(len(offset_mapping), max_text_len)
+                    for tok_ind in range(valid_len):
+                        tok_start, tok_end = offset_mapping[tok_ind]
+                        if tok_end <= tok_start:
+                            continue
+                        if tok_start < char_end and tok_end > char_start:
+                            matched_token_inds.append(tok_ind)
+
+                # Fallback path: char_to_token compatibility for tokenizer
+                # variants that do not expose usable offset mappings.
+                if len(matched_token_inds) == 0:
+                    beg_pos = self._get_char_to_token(tokenized, char_start)
+                    end_pos = self._get_char_to_token(tokenized, char_end - 1)
+
+                    if beg_pos is None:
+                        for delta in (1, 2):
+                            beg_pos = self._get_char_to_token(
+                                tokenized, char_start + delta)
+                            if beg_pos is not None:
+                                break
+                    if end_pos is None:
+                        for delta in (1, 2):
+                            end_pos = self._get_char_to_token(
+                                tokenized, char_end - 1 - delta)
+                            if end_pos is not None:
+                                break
+
+                    if beg_pos is not None and end_pos is not None:
+                        beg_pos = max(0, beg_pos)
+                        end_pos = min(end_pos, max_text_len - 1)
+                        if beg_pos <= end_pos:
+                            matched_token_inds = list(
+                                range(beg_pos, end_pos + 1))
+
+                # Last fallback: token-id search, but pick the match nearest
+                # to the target char span to avoid global-first-match errors.
+                if len(matched_token_inds) == 0:
+                    target_word = caption_string[char_start:char_end]
+                    if len(target_word) > 0:
+                        candidate_token_ids = []
+                        token_ids_with_space = tokenizer(
+                            ' ' + target_word,
+                            add_special_tokens=False).input_ids
+                        token_ids_no_space = tokenizer(
+                            target_word,
+                            add_special_tokens=False).input_ids
+                        if len(token_ids_with_space) > 0:
+                            candidate_token_ids.append(token_ids_with_space)
+                        if len(token_ids_no_space) > 0 and \
+                                token_ids_no_space != token_ids_with_space:
+                            candidate_token_ids.append(token_ids_no_space)
+
+                        best_match = None
+                        for token_ids in candidate_token_ids:
+                            token_num = len(token_ids)
+                            for k in range(len(input_ids) - token_num + 1):
+                                if input_ids[k:k + token_num] != token_ids:
+                                    continue
+                                if k >= max_text_len:
+                                    continue
+                                end_k = min(k + token_num, max_text_len)
+                                if offset_mapping is not None and \
+                                        k < len(offset_mapping):
+                                    distance = abs(
+                                        offset_mapping[k][0] - char_start)
+                                else:
+                                    distance = k
+                                # Prefer nearer match first; if tied, prefer
+                                # longer token spans.
+                                match = (distance, -token_num, k, end_k)
+                                if best_match is None or match < best_match:
+                                    best_match = match
+
+                        if best_match is not None:
+                            matched_token_inds = list(
+                                range(best_match[2], best_match[3]))
+
+                if len(matched_token_inds) > 0:
+                    positive_map[j, matched_token_inds] = 1.0
+
+        positive_map_label_to_token = create_positive_map_label_to_token(
+            positive_map, plus=1)
+
         return positive_map_label_to_token, positive_map
 
     def get_tokens_positive_and_prompts(
@@ -320,49 +584,93 @@ class GroundingDINO(DINO):
             original_caption: Union[list, tuple],
             enhanced_text_prompts: Optional[ConfigType] = None):
         chunked_size = self.test_cfg.get('chunked_size', -1)
-        original_caption = [clean_label_name(i) for i in original_caption]
-
-        original_caption_chunked = chunks(original_caption, chunked_size)
-        ids_chunked = chunks(
-            list(range(1,
-                       len(original_caption) + 1)), chunked_size)
+        raw_caption = list(original_caption)
+        display_entities = [clean_label_name(i) for i in raw_caption]
+        if enhanced_text_prompts is None:
+            prompt_entities = [
+                self._to_prompt_entity_name(i) for i in raw_caption
+            ]
+        else:
+            # Keep enhanced prompt key matching behavior consistent with
+            # previous logic (keys are usually based on cleaned class names).
+            prompt_entities = display_entities
 
         positive_map_label_to_token_chunked = []
         caption_string_chunked = []
         positive_map_chunked = []
         entities_chunked = []
 
-        for i in range(len(ids_chunked)):
+        def process_chunk(prompt_chunk: list, display_chunk: list) -> None:
+            if len(prompt_chunk) == 0:
+                return
+
             if enhanced_text_prompts is not None:
                 caption_string, tokens_positive = self.to_enhance_text_prompts(
-                    original_caption_chunked[i], enhanced_text_prompts)
+                    display_chunk, enhanced_text_prompts)
             else:
                 caption_string, tokens_positive = self.to_plain_text_prompts(
-                    original_caption_chunked[i])
-            tokenized = self.language_model.tokenizer([caption_string],
-                                                      return_tensors='pt',
-                                                      return_offsets_mapping=True)
-            if tokenized.input_ids.shape[1] > self.language_model.max_tokens:
+                    prompt_chunk)
+
+            tokenized = self.language_model.tokenizer(
+                [caption_string], return_tensors='pt', return_offsets_mapping=True)
+            token_len = tokenized.input_ids.shape[1]
+            if token_len > self.language_model.max_tokens and \
+                    len(prompt_chunk) > 1:
+                mid = max(1, len(prompt_chunk) // 2)
+                process_chunk(prompt_chunk[:mid], display_chunk[:mid])
+                process_chunk(prompt_chunk[mid:], display_chunk[mid:])
+                return
+            if token_len > self.language_model.max_tokens:
                 warnings.warn('Inputting a text that is too long will result '
                               'in poor prediction performance. '
                               'Please reduce the --chunked-size.')
-                
-            # =================================================================
-            # 【核心修改 4】：向 get_positive_map 传入 caption_string 
-            # =================================================================
+
             positive_map_label_to_token, positive_map = self.get_positive_map(
                 tokenized, tokens_positive, caption_string)
+            unaligned_inds = [
+                idx for idx in range(positive_map.shape[0])
+                if positive_map[idx].sum() == 0
+            ]
+            if len(unaligned_inds) > 0 and len(prompt_chunk) > 1:
+                mid = max(1, len(prompt_chunk) // 2)
+                process_chunk(prompt_chunk[:mid], display_chunk[:mid])
+                process_chunk(prompt_chunk[mid:], display_chunk[mid:])
+                return
+            if len(unaligned_inds) > 0 and len(prompt_chunk) == 1:
+                positive_map_label_to_token, positive_map = \
+                    self._force_single_class_alignment(
+                        tokenized, tokens_positive, caption_string)
 
             caption_string_chunked.append(caption_string)
             positive_map_label_to_token_chunked.append(
                 positive_map_label_to_token)
             positive_map_chunked.append(positive_map)
-            entities_chunked.append(original_caption_chunked[i])
+            entities_chunked.append(display_chunk)
+
+        if enhanced_text_prompts is not None:
+            # For enhanced prompts, keep original fixed-size chunking behavior
+            # as the text template can significantly change token lengths.
+            if chunked_size <= 0:
+                chunked_size = max(1, len(prompt_entities))
+            initial_prompt_chunks = chunks(prompt_entities, chunked_size)
+            initial_display_chunks = chunks(display_entities, chunked_size)
+            initial_chunks = list(zip(initial_prompt_chunks,
+                                      initial_display_chunks))
+        else:
+            initial_chunks = self._split_entities_by_token_budget(
+                prompt_entities, display_entities)
+
+        for prompt_chunk, display_chunk in initial_chunks:
+            process_chunk(prompt_chunk, display_chunk)
 
         return positive_map_label_to_token_chunked, \
             caption_string_chunked, \
             positive_map_chunked, \
             entities_chunked
+
+            # =================================================================
+            # 【核心修改 4】：向 get_positive_map 传入 caption_string 
+            # =================================================================
 
     def forward_transformer(
         self,

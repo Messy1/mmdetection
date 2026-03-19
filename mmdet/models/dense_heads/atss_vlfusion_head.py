@@ -40,15 +40,24 @@ def convert_grounding_to_cls_scores(logits: Tensor,
             # only need to compute once
             positive_map = positive_maps[0]
             for label_j in positive_map:
-                scores[:, :, label_j -
-                       1] = logits[:, :,
-                                   torch.LongTensor(positive_map[label_j]
-                                                    )].mean(-1)
+                token_inds = positive_map[label_j]
+                if len(token_inds) == 0:
+                    scores[:, :, label_j - 1] = float('-inf')
+                    continue
+                token_inds = torch.as_tensor(
+                    token_inds, dtype=torch.long, device=logits.device)
+                scores[:, :, label_j - 1] = logits[:, :, token_inds].mean(-1)
         else:
             for i, positive_map in enumerate(positive_maps):
                 for label_j in positive_map:
+                    token_inds = positive_map[label_j]
+                    if len(token_inds) == 0:
+                        scores[i, :, label_j - 1] = float('-inf')
+                        continue
+                    token_inds = torch.as_tensor(
+                        token_inds, dtype=torch.long, device=logits.device)
                     scores[i, :, label_j - 1] = logits[
-                        i, :, torch.LongTensor(positive_map[label_j])].mean(-1)
+                        i, :, token_inds].mean(-1)
     return scores
 
 

@@ -427,8 +427,42 @@ class GroundingDINOHead(DINOHead):
             bbox_index = indexes // num_classes
             bbox_pred = bbox_pred[bbox_index]
         else:
-            cls_score = cls_score.sigmoid()
-            scores, _ = cls_score.max(-1)
+            # REC task path (token_positive_map is None):
+            # aggregate token scores to one score for each query.
+            rec_token_pooling = self.test_cfg.get('rec_token_pooling', 'max')
+            cls_score_sigmoid = cls_score.sigmoid()
+
+            if rec_token_pooling == 'rel_thr_mean':
+                # Relative-threshold mean:
+                # keep tokens whose score >= alpha * max_token_score.
+                # `cls_score` uses -inf on invalid/padded tokens.
+                rec_token_rel_thr = float(
+                    self.test_cfg.get('rec_token_rel_thr', 0.75))
+                rec_token_rel_thr = min(max(rec_token_rel_thr, 0.0), 1.0)
+
+                valid_token_mask = torch.isfinite(cls_score)
+                valid_scores = cls_score_sigmoid.masked_fill(
+                    ~valid_token_mask, float('-inf'))
+                row_max_scores, _ = valid_scores.max(dim=-1, keepdim=True)
+                rel_thresh = row_max_scores * rec_token_rel_thr
+                selected_mask = valid_token_mask & (
+                    cls_score_sigmoid >= rel_thresh)
+
+                selected_count = selected_mask.sum(dim=-1)
+                selected_scores = (cls_score_sigmoid *
+                                   selected_mask.float()).sum(dim=-1)
+                scores = selected_scores / selected_count.clamp(min=1)
+
+                # Safety fallback for degenerated rows.
+                fallback_scores, _ = valid_scores.max(dim=-1)
+                fallback_scores = torch.where(
+                    torch.isfinite(fallback_scores), fallback_scores,
+                    torch.zeros_like(fallback_scores))
+                scores = torch.where(selected_count > 0, scores,
+                                     fallback_scores)
+            else:
+                # Default legacy behavior.
+                scores, _ = cls_score_sigmoid.max(-1)
             scores, indexes = scores.topk(max_per_img)
             bbox_pred = bbox_pred[indexes]
             det_labels = scores.new_zeros(scores.shape, dtype=torch.long)
