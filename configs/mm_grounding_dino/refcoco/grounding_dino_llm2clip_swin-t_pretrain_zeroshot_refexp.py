@@ -1,4 +1,5 @@
-_base_ = '../grounding_dino_llm2clip_swin-t_pretrain.py'
+# _base_ = '../grounding_dino_llm2clip_swin-t_pretrain.py'
+_base_ = '../grounding_dino_llm2clip_vision_adapter.py'
 
 # 30 is an empirical value, just set it to the maximum value
 # without affecting the evaluation result

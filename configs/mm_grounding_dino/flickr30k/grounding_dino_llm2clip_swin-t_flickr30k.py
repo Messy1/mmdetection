@@ -1,6 +1,7 @@
 # ==================== 1. 继承最新的 LLM2CLIP 训练配置 ====================
 # 【核心修改】：将 base 指向我们刚刚写好的那个最终版预训练配置
-_base_ = '../grounding_dino_llm2clip_swin-t_pretrain.py' 
+# _base_ = '../grounding_dino_llm2clip_swin-t_pretrain.py' 
+_base_ = '../grounding_dino_llm2clip_vision_adapter.py'  # 继承了 LLM2CLIP 视觉适配器的配置，直接使用其中的模型定义和训练配置
 
 # ==================== 2. 数据集与评测配置 (Flickr30k) ====================
 dataset_type = 'Flickr30kDataset'

@@ -1,5 +1,7 @@
 # _base_ = '../grounding_dino_llm2vec_swin-t_pretrain.py'
-_base_ = '../grounding_dino_llm2clip_swin-t_pretrain.py'
+# _base_ = '../grounding_dino_llm2clip_swin-t_pretrain.py'
+_base_ = '../grounding_dino_llm2clip_vision_adapter.py'  # 继承了 LLM2CLIP 视觉适配器的配置，直接使用其中的模型定义和训练配置
+# _base_ = '../grounding_dino_swin-t_pretrain_obj365.py'
 
 
 data_root = 'data/d3/'

@@ -20,6 +20,46 @@ from .glip import (create_positive_map, create_positive_map_label_to_token,
                    run_ner)
 
 
+class HighDimFusionEncoderLayer(nn.Module):
+    """Text-conditioned fusion layer in a high-dimensional space."""
+
+    def __init__(self,
+                 embed_dims: int,
+                 num_heads: int = 8,
+                 ffn_ratio: float = 4.0,
+                 dropout: float = 0.0) -> None:
+        super().__init__()
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim=embed_dims,
+            num_heads=num_heads,
+            dropout=dropout,
+            batch_first=True)
+        self.norm1 = nn.LayerNorm(embed_dims)
+
+        ffn_hidden_dim = int(embed_dims * ffn_ratio)
+        self.ffn = nn.Sequential(
+            nn.Linear(embed_dims, ffn_hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(ffn_hidden_dim, embed_dims),
+            nn.Dropout(dropout))
+        self.norm2 = nn.LayerNorm(embed_dims)
+
+    def forward(self,
+                visual_tokens: Tensor,
+                text_tokens: Tensor,
+                text_key_padding_mask: Optional[Tensor] = None) -> Tensor:
+        attn_out = self.cross_attn(
+            query=visual_tokens,
+            key=text_tokens,
+            value=text_tokens,
+            key_padding_mask=text_key_padding_mask,
+            need_weights=False)[0]
+        visual_tokens = self.norm1(visual_tokens + attn_out)
+        visual_tokens = self.norm2(visual_tokens + self.ffn(visual_tokens))
+        return visual_tokens
+
+
 def clean_label_name(name: str) -> str:
     name = re.sub(r'\(.*\)', '', name)
     name = re.sub(r'_', ' ', name)
@@ -58,6 +98,14 @@ class GroundingDINO(DINO):
                  use_autocast=False,
                  text_mapper_hidden_dim=1024,
                  text_mapper_type='mlp',
+                 enable_hd_fusion_bridge=False,
+                 hd_fusion_dim=0,
+                 hd_fusion_num_layers=1,
+                 hd_fusion_num_heads=8,
+                 hd_fusion_ffn_ratio=4.0,
+                 hd_fusion_dropout=0.0,
+                 hd_fusion_residual=True,
+                 hd_fusion_res_scale=1.0,
                  **kwargs) -> None:
 
         self.language_model_cfg = language_model
@@ -66,6 +114,14 @@ class GroundingDINO(DINO):
         self.use_autocast = use_autocast
         self.text_mapper_hidden_dim = text_mapper_hidden_dim
         self.text_mapper_type = text_mapper_type
+        self.enable_hd_fusion_bridge = enable_hd_fusion_bridge
+        self.hd_fusion_dim = hd_fusion_dim
+        self.hd_fusion_num_layers = hd_fusion_num_layers
+        self.hd_fusion_num_heads = hd_fusion_num_heads
+        self.hd_fusion_ffn_ratio = hd_fusion_ffn_ratio
+        self.hd_fusion_dropout = hd_fusion_dropout
+        self.hd_fusion_residual = hd_fusion_residual
+        self.hd_fusion_res_scale = hd_fusion_res_scale
         super().__init__(*args, **kwargs)
 
     def _init_layers(self) -> None:
@@ -94,6 +150,7 @@ class GroundingDINO(DINO):
             lang_dim = self.language_model.language_dim
         else:
             lang_dim = self.language_model.language_backbone.body.language_dim
+        self.lang_dim = lang_dim
 
         # self.text_feat_map = nn.Linear(
         #     lang_dim,
@@ -120,6 +177,26 @@ class GroundingDINO(DINO):
                 f'Unsupported text_mapper_type={self.text_mapper_type}. '
                 'Expected one of: "mlp", "linear".')
 
+        if self.enable_hd_fusion_bridge:
+            fusion_dim = self.hd_fusion_dim if self.hd_fusion_dim > 0 \
+                else self.lang_dim
+            self.hd_fusion_dim = fusion_dim
+            self.visual_up_projector = nn.Linear(self.embed_dims, fusion_dim)
+            if fusion_dim == self.lang_dim:
+                self.text_highdim_projector = nn.Identity()
+            else:
+                self.text_highdim_projector = nn.Linear(
+                    self.lang_dim, fusion_dim)
+            self.hd_fusion_layers = nn.ModuleList([
+                HighDimFusionEncoderLayer(
+                    embed_dims=fusion_dim,
+                    num_heads=self.hd_fusion_num_heads,
+                    ffn_ratio=self.hd_fusion_ffn_ratio,
+                    dropout=self.hd_fusion_dropout)
+                for _ in range(max(1, int(self.hd_fusion_num_layers)))
+            ])
+            self.visual_down_projector = nn.Linear(fusion_dim, self.embed_dims)
+
     def init_weights(self) -> None:
         """Initialize weights for Transformer and other components."""
         super().init_weights()
@@ -137,6 +214,43 @@ class GroundingDINO(DINO):
             # 兼容老版本的单层写法
             nn.init.xavier_uniform_(self.text_feat_map.weight.data)
             nn.init.constant_(self.text_feat_map.bias.data, 0)
+
+        if self.enable_hd_fusion_bridge:
+            nn.init.xavier_uniform_(self.visual_up_projector.weight.data)
+            nn.init.constant_(self.visual_up_projector.bias.data, 0)
+            if isinstance(self.text_highdim_projector, nn.Linear):
+                nn.init.xavier_uniform_(
+                    self.text_highdim_projector.weight.data)
+                nn.init.constant_(self.text_highdim_projector.bias.data, 0)
+            nn.init.xavier_uniform_(self.visual_down_projector.weight.data)
+            nn.init.constant_(self.visual_down_projector.bias.data, 0)
+
+    def _apply_hd_fusion_bridge(self, feat: Tensor, text_dict: Dict) -> Tensor:
+        """Fuse flattened visual features with raw text features."""
+        if not self.enable_hd_fusion_bridge:
+            return feat
+        if 'embedded_raw' not in text_dict:
+            return feat
+
+        visual_high = self.visual_up_projector(feat)
+        text_high = self.text_highdim_projector(text_dict['embedded_raw'])
+
+        text_token_mask = text_dict.get('text_token_mask', None)
+        text_key_padding_mask = None
+        if text_token_mask is not None:
+            text_key_padding_mask = ~text_token_mask.bool()
+
+        fused_visual = visual_high
+        for layer in self.hd_fusion_layers:
+            fused_visual = layer(
+                visual_tokens=fused_visual,
+                text_tokens=text_high,
+                text_key_padding_mask=text_key_padding_mask)
+
+        fused_visual = self.visual_down_projector(fused_visual)
+        if self.hd_fusion_residual:
+            return feat + self.hd_fusion_res_scale * fused_visual
+        return fused_visual
 
     def to_enhance_text_prompts(self, original_caption, enhanced_text_prompts):
         caption_string = ''
@@ -681,6 +795,10 @@ class GroundingDINO(DINO):
         encoder_inputs_dict, decoder_inputs_dict = self.pre_transformer(
             img_feats, batch_data_samples)
 
+        if self.enable_hd_fusion_bridge:
+            encoder_inputs_dict['feat'] = self._apply_hd_fusion_bridge(
+                encoder_inputs_dict['feat'], text_dict)
+
         encoder_outputs_dict = self.forward_encoder(
             **encoder_inputs_dict, text_dict=text_dict)
 
@@ -860,6 +978,8 @@ class GroundingDINO(DINO):
                     new_text_prompts.append(caption_string)
 
         text_dict = self.language_model(new_text_prompts)
+        if self.enable_hd_fusion_bridge:
+            text_dict['embedded_raw'] = text_dict['embedded']
         if self.text_feat_map is not None:
             text_dict['embedded'] = self.text_feat_map(text_dict['embedded'])
 
@@ -936,6 +1056,8 @@ class GroundingDINO(DINO):
                 text_prompts_once = [text_prompts[0][b]]
                 token_positive_maps_once = token_positive_maps[0][b]
                 text_dict = self.language_model(text_prompts_once)
+                if self.enable_hd_fusion_bridge:
+                    text_dict['embedded_raw'] = text_dict['embedded']
                 # text feature map layer
                 if self.text_feat_map is not None:
                     text_dict['embedded'] = self.text_feat_map(
@@ -960,6 +1082,8 @@ class GroundingDINO(DINO):
         else:
             # extract text feats
             text_dict = self.language_model(list(text_prompts))
+            if self.enable_hd_fusion_bridge:
+                text_dict['embedded_raw'] = text_dict['embedded']
             # text feature map layer
             if self.text_feat_map is not None:
                 text_dict['embedded'] = self.text_feat_map(
